@@ -772,7 +772,8 @@ typedef struct {
 #define DT_RELRSZ	35
 #define DT_RELR		36
 #define DT_RELRENT	37
-#define	DT_NUM		38
+#define DT_CREL		0x40000026 // TODO
+#define	DT_NUM		39
 #define DT_LOOS		0x6000000d
 #define DT_HIOS		0x6ffff000
 #define DT_LOPROC	0x70000000

@@ -376,6 +376,18 @@ nomatch:
 	return (struct symdef){ 0 };
 }
 
+__attribute__((optimize("no-unroll-loops")))
+static size_t get_leb128(unsigned char **buf, size_t sleb_uleb)
+{
+	size_t tmp = 0, shift = 0, byte;
+	do {
+		byte = *(*buf)++;
+		tmp += (byte - 128*(byte >= sleb_uleb)) << shift;
+		shift += 7;
+	} while (byte >= 128);
+	return tmp;
+}
+
 static void do_relocs(struct dso *dso, size_t *rel, size_t rel_size, size_t stride)
 {
 	unsigned char *base = dso->base;
@@ -391,6 +403,8 @@ static void do_relocs(struct dso *dso, size_t *rel, size_t rel_size, size_t stri
 	size_t sym_val;
 	size_t tls_val;
 	size_t addend;
+	size_t offset, offset_shift, rel_head;
+	unsigned char *relp;
 	int skip_relative = 0, reuse_addends = 0, save_slot = 0;
 
 	if (dso == &ldso) {
@@ -400,28 +414,48 @@ static void do_relocs(struct dso *dso, size_t *rel, size_t rel_size, size_t stri
 		skip_relative = 1;
 	}
 
-	for (; rel_size; rel+=stride, rel_size-=stride*sizeof(size_t)) {
-		if (skip_relative && IS_RELATIVE(rel[1], dso->syms)) continue;
-		type = R_TYPE(rel[1]);
-		if (type == REL_NONE) continue;
-		reloc_addr = laddr(dso, rel[0]);
+	if (!stride) {
+		offset = sym_index = addend = type = 0;
+		relp = (unsigned char*)rel;
+		rel_size = get_leb128(&relp, 128);
+		offset_shift = rel_size & 3;
+		rel_size >>= 3;
+	}
 
-		if (stride > 2) {
-			addend = rel[2];
-		} else if (type==REL_GOT || type==REL_PLT|| type==REL_COPY) {
-			addend = 0;
-		} else if (reuse_addends) {
-			/* Save original addend in stage 2 where the dso
-			 * chain consists of just ldso; otherwise read back
-			 * saved addend since the inline one was clobbered. */
-			if (head==&ldso)
-				saved_addends[save_slot] = *reloc_addr;
-			addend = saved_addends[save_slot++];
-		} else {
+	for (; rel_size; rel+=stride, rel_size-=stride*sizeof(size_t)) {
+		if (!stride) {
+			rel_head = *relp++;
+			offset += rel_head >> 2;
+			if (rel_head >= 128) offset += (get_leb128(&relp, 128) << 5) - 32;
+                        reloc_addr = laddr(dso, offset << offset_shift);
 			addend = *reloc_addr;
+			if (rel_head & 1) sym_index += get_leb128(&relp, 64);
+			if (rel_head & 2) type += get_leb128(&relp, 64);
+			rel_size--;
+		} else {
+			if (skip_relative && IS_RELATIVE(rel[1], dso->syms)) continue;
+			type = R_TYPE(rel[1]);
+			if (type == REL_NONE) continue;
+			reloc_addr = laddr(dso, rel[0]);
+
+			if (stride > 2) {
+				addend = rel[2];
+			} else if (type==REL_GOT || type==REL_PLT|| type==REL_COPY) {
+				addend = 0;
+			} else if (reuse_addends) {
+				/* Save original addend in stage 2 where the dso
+				 * chain consists of just ldso; otherwise read back
+				 * saved addend since the inline one was clobbered. */
+				if (head==&ldso)
+					saved_addends[save_slot] = *reloc_addr;
+				addend = saved_addends[save_slot++];
+			} else {
+				addend = *reloc_addr;
+			}
+
+			sym_index = R_SYM(rel[1]);
 		}
 
-		sym_index = R_SYM(rel[1]);
 		if (sym_index) {
 			sym = syms + sym_index;
 			name = strings + sym->st_name;
@@ -463,7 +497,7 @@ static void do_relocs(struct dso *dso, size_t *rel, size_t rel_size, size_t stri
 
 		switch(type) {
 		case REL_OFFSET:
-			addend -= (size_t)reloc_addr;
+			*reloc_addr = sym_val + addend - (size_t)reloc_addr;
 		case REL_SYMBOLIC:
 		case REL_GOT:
 		case REL_PLT:
@@ -514,7 +548,7 @@ static void do_relocs(struct dso *dso, size_t *rel, size_t rel_size, size_t stri
 			break;
 #endif
 		case REL_TLSDESC:
-			if (stride<3) addend = reloc_addr[!TLSDESC_BACKWARDS];
+			if (stride==2) addend = reloc_addr[!TLSDESC_BACKWARDS];
 			if (def.dso->tls_id > static_tls_cnt) {
 				struct td_index *new = malloc(sizeof *new);
 				if (!new) {
@@ -1406,18 +1440,20 @@ static void do_mips_relocs(struct dso *p, size_t *got)
 
 static void reloc_all(struct dso *p)
 {
-	size_t dyn[DYN_CNT];
+	size_t dyn[DYN_CNT], crel;
 	for (; p; p=p->next) {
 		if (p->relocated) continue;
 		decode_vec(p->dynv, dyn, DYN_CNT);
 		if (NEED_MIPS_GOT_RELOCS)
 			do_mips_relocs(p, laddr(p, dyn[DT_PLTGOT]));
 		do_relocs(p, laddr(p, dyn[DT_JMPREL]), dyn[DT_PLTRELSZ],
-			2+(dyn[DT_PLTREL]==DT_RELA));
+			dyn[DT_PLTREL]==DT_CREL?0:2+(dyn[DT_PLTREL]==DT_RELA));
 		do_relocs(p, laddr(p, dyn[DT_REL]), dyn[DT_RELSZ], 2);
 		do_relocs(p, laddr(p, dyn[DT_RELA]), dyn[DT_RELASZ], 3);
 		if (!DL_FDPIC)
 			do_relr_relocs(p, laddr(p, dyn[DT_RELR]), dyn[DT_RELRSZ]);
+		if (search_vec(p->dynv, &crel, DT_CREL))
+			do_relocs(p, laddr(p, crel), 0, 0);
 
 		if (head != &ldso && p->relro_start != p->relro_end) {
 			long ret = __syscall(SYS_mprotect, laddr(p, p->relro_start),
@@ -2075,12 +2111,21 @@ void __dls3(size_t *sp, size_t *auxv)
 
 static void prepare_lazy(struct dso *p)
 {
-	size_t dyn[DYN_CNT], n, flags1=0;
+	size_t dyn[DYN_CNT], n, flags1=0, crel, crel_cnt;
+	unsigned char *crel_p;
 	decode_vec(p->dynv, dyn, DYN_CNT);
 	search_vec(p->dynv, &flags1, DT_FLAGS_1);
 	if (dyn[DT_BIND_NOW] || (dyn[DT_FLAGS] & DF_BIND_NOW) || (flags1 & DF_1_NOW))
 		return;
 	n = dyn[DT_RELSZ]/2 + dyn[DT_RELASZ]/3 + dyn[DT_PLTRELSZ]/2 + 1;
+	if (search_vec(p->dynv, &crel, DT_CREL)) {
+		crel_p = laddr(p, crel);
+		crel_cnt = *crel_p++ >> 2;
+		if (crel_cnt > 0x20)
+			crel_cnt += get_leb128(&crel_p, 128) - 0x20;
+		n += crel_cnt;
+	}
+
 	if (NEED_MIPS_GOT_RELOCS) {
 		size_t j=0; search_vec(p->dynv, &j, DT_MIPS_GOTSYM);
 		size_t i=0; search_vec(p->dynv, &i, DT_MIPS_SYMTABNO);
